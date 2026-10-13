@@ -8,6 +8,7 @@
  */
 import fs from 'fs'
 import path from 'path'
+import { execFileSync } from 'child_process'
 import { fileURLToPath } from 'url'
 import { createRequire } from 'module'
 
@@ -18,6 +19,48 @@ const RES = path.join(DESKTOP, 'resources')
 
 fs.rmSync(RES, { recursive: true, force: true })
 fs.mkdirSync(RES, { recursive: true })
+
+/**
+ * 用 `file` 命令读二进制架构，匹配 arm64 / x86_64 / x64。
+ * `file` 在 macOS 自带、Linux 也在 coreutils，无需引新依赖。
+ */
+function readArchOf(binPath) {
+  try {
+    const out = execFileSync('file', [binPath], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+    if (/arm64|aarch64/i.test(out)) return 'arm64'
+    if (/x86[_-]64|amd64/i.test(out)) return 'x64'
+    return 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+/**
+ * 校验两个二进制架构一致。darwin/arm64 缺失 Rosetta 时，x86_64 二进制
+ * spawn 即报 "bad CPU type" → 桌面版视频拼接全失败。这里提前在打包阶段
+ * 暴露问题，避免错误二进制流入 dmg。
+ */
+function detectArchMismatch(nameA, pathA, nameB, pathB) {
+  const archA = readArchOf(pathA)
+  const archB = readArchOf(pathB)
+  if (archA === 'unknown' || archB === 'unknown') {
+    console.warn(`[prepare-resources] 架构探测失败（${nameA}=${archA}, ${nameB}=${archB}），跳过自检。请确认本机已安装 file 工具。`)
+    return
+  }
+  if (archA !== archB) {
+    console.error(
+      `[prepare-resources] 架构不一致：${nameA}=${archA}，${nameB}=${archB}。\n` +
+      `  这会导致桌面版在 Apple Silicon（无 Rosetta）/ 其它架构上运行失败（#135）。\n` +
+      `  常见原因：ffprobe-static v3.1.0 的 bin/darwin/arm64/ffprobe 实际是 x86_64，\n` +
+      `  打包脚本误取该路径。修复建议：\n` +
+      `    1) 在本机用 arm64 native ffmpeg 替换 resources/bin-mac/ffprobe，\n` +
+      `    2) 或 rm -rf node_modules && npm install 重新触发 postinstall。\n` +
+      `  详见 https://github.com/chatfire-AI/huobao-drama/issues/135`,
+    )
+    process.exit(1)
+  }
+  console.log(`[prepare-resources] 架构自检通过：${nameA}=${nameB}=${archA}`)
+}
 
 // 1. 前端静态产物
 const frontendSrc = path.join(REPO, 'frontend', '.output', 'public')
@@ -51,6 +94,12 @@ fs.copyFileSync(ffmpegPath, path.join(binMac, 'ffmpeg'))
 fs.copyFileSync(ffprobePath, path.join(binMac, 'ffprobe'))
 fs.chmodSync(path.join(binMac, 'ffmpeg'), 0o755)
 fs.chmodSync(path.join(binMac, 'ffprobe'), 0o755)
+
+// 3a. 架构自检：ffmpeg 和 ffprobe 必须都是本机架构（避免 #135：ffprobe-static v3.1.0
+//     在某些 install 配置下会取出错误架构的二进制，最典型就是 darwin/arm64 install
+//     后 bin/darwin/arm64/ffprobe 实际是 x86_64，导致无 Rosetta 的 Apple Silicon 拼接
+//     失败。`file` 命令在任何 macOS / Linux 都自带，不引新依赖。
+detectArchMismatch('ffmpeg', path.join(binMac, 'ffmpeg'), 'ffprobe', path.join(binMac, 'ffprobe'))
 console.log('resources/bin-mac ✓')
 
 // 3b. Windows 二进制（打 win 包用；不打 win 包时缺失不报错，仅提示）
